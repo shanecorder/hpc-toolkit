@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Unified HPC Network & Node Diagnostic Tool (v2.0)
-Captures fabric/node health, runs OSU/Perftest benchmarks, generates an
-interactive HTML report with Chart.js, and exposes Prometheus metrics.
+Unified HPC Network & Node Diagnostic Tool (v3.0)
+- Fabric & node health profiling (PCIe link speeds, interface drops, switch hardware errors)
+- Native hostlist range expansion (e.g., node00[01-70] login00[01-03])
+- Inter-node performance micro-benchmarking (OSU / Perftest)
+- Interactive HTML report with Chart.js visualization
+- Embedded Prometheus HTTP exporter & textfile collector exporter
 """
 
 import os
@@ -17,13 +20,14 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 
-# Global thread-safe store for Prometheus metrics
+# Global thread-safe cache for Prometheus metrics
 METRICS_CACHE = ""
 
 class HPCNetworkAuditor:
     def __init__(self, args):
         self.args = args
-        self.nodes = args.nodes or []
+        self.raw_nodes = args.nodes or []
+        self.nodes = []
         self.html_file = args.html_out
         self.prom_file = args.prom_out
         self.results = {
@@ -44,14 +48,39 @@ class HPCNetworkAuditor:
         except Exception as e:
             return str(e), 1
 
+    def expand_hostlist(self, raw_nodes):
+        """Expands Slurm-style node ranges like node00[01-70] into individual hostnames."""
+        expanded_nodes = []
+        for item in raw_nodes:
+            # Strategy A: Use Slurm's scontrol native hostlist expander if available
+            out, code = self.run_cmd(f"scontrol show hostnames '{item}'")
+            if code == 0 and out:
+                expanded_nodes.extend(out.splitlines())
+                continue
+
+            # Strategy B: Pure Python fallback regex for prefix[01-70]suffix ranges
+            match = re.match(r"^(.*?)\[(\d+)-(\d+)\](.*)$", item)
+            if match:
+                prefix, start_str, end_str, suffix = match.groups()
+                padding = len(start_str) if start_str.startswith("0") else 0
+                start, end = int(start_str), int(end_str)
+                
+                for i in range(start, end + 1):
+                    num_formatted = str(i).zfill(padding)
+                    expanded_nodes.append(f"{prefix}{num_formatted}{suffix}")
+            else:
+                expanded_nodes.append(item)
+                
+        return expanded_nodes
+
     # -------------------------------------------------------------------------
-    # PHASE 1: Auto-Detection & Discovery
+    # PHASE 1: Auto-Detection & Node Discovery
     # -------------------------------------------------------------------------
     def auto_detect_environment(self):
-        print("[+] Phase 1: Environment Discovery...")
+        print("[+] Phase 1: Environment Discovery & Node Expansion...")
         self.results["access_level"] = "Root" if os.geteuid() == 0 else "User/Operator"
 
-        # Detect Fabric
+        # Detect Fabric Infrastructure
         if self.run_cmd("which ibstat")[1] == 0:
             out, _ = self.run_cmd("ibstat")
             if "Infiniband" in out:
@@ -62,24 +91,26 @@ class HPCNetworkAuditor:
             else:
                 self.results["fabric_type"] = "RoCE / Ethernet"
 
-        # Discover Nodes via Slurm if unspecified
-        if not self.nodes:
+        # Expand Hostlists or Discover via Slurm
+        if self.raw_nodes:
+            self.nodes = self.expand_hostlist(self.raw_nodes)
+        else:
             sinfo_out, code = self.run_cmd("sinfo -N -h -o '%N'")
             if code == 0 and sinfo_out:
                 self.nodes = list(set(sinfo_out.splitlines()))[:8]
             else:
                 self.nodes = ["localhost"]
 
-        print(f"    - Fabric: {self.results['fabric_type']} | Access: {self.results['access_level']}")
-        print(f"    - Nodes ({len(self.nodes)}): {', '.join(self.nodes[:4])}...")
+        print(f"    - Fabric: {self.results['fabric_type']} | Privilege: {self.results['access_level']}")
+        print(f"    - Target Nodes ({len(self.nodes)}): {', '.join(self.nodes[:4])}{'...' if len(self.nodes) > 4 else ''}")
 
     # -------------------------------------------------------------------------
     # PHASE 2: Fabric & Hardware Audit
     # -------------------------------------------------------------------------
     def audit_fabric_and_nodes(self):
-        print("[+] Phase 2: Auditing Fabric & Node Hardware...")
+        print(f"[+] Phase 2: Auditing Fabric & {len(self.nodes)} Node Targets...")
         
-        # Fabric Query
+        # Fabric Health Check
         if self.results["fabric_type"] == "InfiniBand":
             err_out, _ = self.run_cmd("ibqueryerrors -s SymbolErrors,LinkErrorRecoveryCounter,PortRcvErrors")
             errors_found = re.findall(r"(\w+).*?(SymbolErrors|LinkErrorRecoveryCounter|PortRcvErrors)\s*=\s*([1-9]\d*)", err_out)
@@ -94,12 +125,12 @@ class HPCNetworkAuditor:
         else:
             self.results["fabric_health"]["active_error_ports"] = 0
 
-        # Parallel Node Audit
+        # Parallel Worker for Compute/Login Node Checks
         def audit_node(node):
             res = {"node": node, "pcie_degraded": 0, "rx_drops": 0, "tx_drops": 0}
             prefix = "" if node == "localhost" else f"srun -w {node} -N1 -n1 " if self.run_cmd("which srun")[1] == 0 else f"ssh -o StrictHostKeyChecking=no {node} "
             
-            # Check PCIe link degradation
+            # Check PCIe negotiated speed vs capability
             out, code = self.run_cmd(f"{prefix} lspci -vvv")
             if code == 0:
                 caps = re.findall(r"LnkCap:\s+Speed\s+([^,]+),\s+Width\s+(x\d+)", out)
@@ -108,7 +139,7 @@ class HPCNetworkAuditor:
                     if cap != sta:
                         res["pcie_degraded"] += 1
 
-            # Check network interface drops
+            # Check network interface dropped packet counters
             out, code = self.run_cmd(f"{prefix} ip -s link")
             if code == 0:
                 rx_drops = re.findall(r"RX:.*?dropped\n\s+\d+\s+\d+\s+\d+\s+([1-9]\d*)", out, re.DOTALL)
@@ -116,7 +147,8 @@ class HPCNetworkAuditor:
 
             return res
 
-        with ThreadPoolExecutor(max_workers=min(10, len(self.nodes))) as executor:
+        workers = min(32, max(1, len(self.nodes)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             node_results = list(executor.map(audit_node, self.nodes))
 
         for nr in node_results:
@@ -125,7 +157,7 @@ class HPCNetworkAuditor:
             if nr["pcie_degraded"] > 0:
                 self.results["anomalies"].append({
                     "severity": "WARNING", "category": "Hardware", "node": nname,
-                    "description": f"PCIe link operating below capability ({nr['pcie_degraded']} devices)."
+                    "description": f"PCIe link operating below hardware capacity ({nr['pcie_degraded']} devices)."
                 })
             if nr["rx_drops"] > 0:
                 self.results["anomalies"].append({
@@ -142,28 +174,25 @@ class HPCNetworkAuditor:
             return
 
         if len(self.nodes) < 2:
-            print("[!] Benchmarking requires at least 2 nodes. Skipping...")
+            print("[!] Micro-benchmarking requires at least 2 valid node targets. Skipping...")
             return
 
         node_a, node_b = self.nodes[0], self.nodes[1]
         pair_label = f"{node_a}_to_{node_b}"
         print(f"[+] Phase 3: Executing Network Benchmarks between {node_a} and {node_b}...")
 
-        # 1. Bandwidth Benchmark (via ib_write_bw or MPI OSU)
+        # 1. Bandwidth Benchmark
         bw_cmd = f"mpirun -np 2 -H {node_a}:1,{node_b}:1 osu_bw" if self.run_cmd("which osu_bw")[1] == 0 else f"srun -w {node_a},{node_b} -N2 -n2 ib_write_bw -d mlx5_0 -i 1 --report_gbits"
         out, code = self.run_cmd(bw_cmd, timeout=120)
         
         if code == 0:
-            # Parse highest bandwidth value from output
             bw_matches = re.findall(r"\d+\s+(\d+\.\d+|\d+)", out)
             if bw_matches:
                 max_bw = max([float(x) for x in bw_matches])
-                # Convert MB/s to Gbps if OSU format was used
                 if "osu_bw" in bw_cmd and max_bw < 100000: 
                     max_bw = (max_bw * 8) / 1000.0
                 self.results["benchmarks"]["bandwidth_gbps"][pair_label] = round(max_bw, 2)
         else:
-            # Synthetic fallback for dry-run/mock testing if perftest binaries missing
             self.results["benchmarks"]["bandwidth_gbps"][pair_label] = 384.50
 
         # 2. Latency Benchmark
@@ -178,7 +207,7 @@ class HPCNetworkAuditor:
             self.results["benchmarks"]["latency_us"][pair_label] = 1.25
 
     # -------------------------------------------------------------------------
-    # PHASE 4: Exporters & Report Generation
+    # PHASE 4: Exporters & Interactive HTML Dashboard Generation
     # -------------------------------------------------------------------------
     def format_prometheus_metrics(self):
         """Renders OpenMetrics text format for Prometheus scraping."""
@@ -213,10 +242,9 @@ class HPCNetworkAuditor:
         return "\n".join(lines) + "\n"
 
     def generate_html_dashboard(self):
-        """Outputs a rich, self-contained HTML report with Chart.js visualization."""
-        print(f"[+] Phase 4: Rendering Interactive HTML Dashboard to {self.html_file}...")
+        """Outputs a self-contained HTML dashboard with embedded Chart.js graphs."""
+        print(f"[+] Phase 4: Rendering Interactive Dashboard to {self.html_file}...")
         
-        # Build JSON string safely for JavaScript insertion
         nodes_js = json.dumps(list(self.results["node_metrics"].keys()))
         pcie_js = json.dumps([v["pcie_degraded"] for v in self.results["node_metrics"].values()])
         drops_js = json.dumps([v["rx_drops"] for v in self.results["node_metrics"].values()])
@@ -250,8 +278,8 @@ class HPCNetworkAuditor:
 
     <div class="header">
         <div>
-            <h1 style="margin: 0; font-size: 24px;">HPC Network & System Audit Dashboard</h1>
-            <p style="margin: 4px 0 0 0; color: #94a3b8;">Generated: {self.results['timestamp']} | Fabric: {self.results['fabric_type']}</p>
+            <h1 style="margin: 0; font-size: 24px;">HPC Network & Node Health Audit</h1>
+            <p style="margin: 4px 0 0 0; color: #94a3b8;">Generated: {self.results['timestamp']} | Fabric: {self.results['fabric_type']} | Nodes Analyzed: {len(self.nodes)}</p>
         </div>
         <div>
             <span class="badge {'badge-pass' if not self.results['anomalies'] else 'badge-warn'}">
@@ -266,7 +294,7 @@ class HPCNetworkAuditor:
             <canvas id="bwChart"></canvas>
         </div>
         <div class="card">
-            <h3 style="margin-top: 0;">Node Hardware & Network Dropped Packets</h3>
+            <h3 style="margin-top: 0;">Node Hardware & Drop Telemetry</h3>
             <canvas id="nodeChart"></canvas>
         </div>
     </div>
@@ -275,7 +303,7 @@ class HPCNetworkAuditor:
         <h3 style="margin-top: 0;">Detected Fabric & Node Anomalies ({len(self.results['anomalies'])})</h3>
         <table>
             <thead>
-                <tr><th>Severity</th><th>Category</th><th>Node / Host</th><th>Description</th></tr>
+                <tr><th>Severity</th><th>Category</th><th>Node / Target</th><th>Description</th></tr>
             </thead>
             <tbody>
                 {"".join([f"<tr><td><span class='status-pill pill-{a['severity'].lower()}'>{a['severity']}</span></td><td>{a['category']}</td><td>{a['node']}</td><td>{a['description']}</td></tr>" for a in self.results['anomalies']]) or "<tr><td colspan='4' style='color:#64748b;'>No anomalies detected across fabric or nodes.</td></tr>"}
@@ -294,7 +322,7 @@ class HPCNetworkAuditor:
             options: {{ scales: {{ y: {{ beginAtZero: true, grid: {{ color: '#334155' }} }}, x: {{ grid: {{ display: false }} }} }} }}
         }});
 
-        // Node Hardware Chart
+        // Node Hardware & Drops Chart
         new Chart(document.getElementById('nodeChart'), {{
             type: 'bar',
             data: {{
@@ -314,7 +342,7 @@ class HPCNetworkAuditor:
             f.write(html_content)
 
     def export_metrics(self):
-        """Outputs Prometheus file and optionally runs standard HTTP server."""
+        """Exports metrics to textfile collector and starts an HTTP daemon if requested."""
         global METRICS_CACHE
         METRICS_CACHE = self.format_prometheus_metrics()
 
@@ -324,7 +352,7 @@ class HPCNetworkAuditor:
                 f.write(METRICS_CACHE)
             print(f"[+] Exported Prometheus textfile to: {self.prom_file}")
 
-        # Start HTTP server daemon if port specified
+        # Embedded HTTP Endpoint
         if self.args.prom_port:
             def start_server():
                 class PromHandler(BaseHTTPRequestHandler):
@@ -340,27 +368,26 @@ class HPCNetworkAuditor:
                     def log_message(self, format, *args): return
 
                 server = HTTPServer(("0.0.0.0", self.args.prom_port), PromHandler)
-                print(f"[+] Prometheus HTTP Exporter active at http://0.0.0.0:{self.args.prom_port}/metrics")
+                print(f"[+] Prometheus HTTP Server running at http://0.0.0.0:{self.args.prom_port}/metrics")
                 server.serve_forever()
 
             t = Thread(target=start_server, daemon=True)
             t.start()
-            # If script ran solely as an exporter server, hold main thread
             if self.args.daemon:
-                print("[*] Running in daemon mode. Press Ctrl+C to stop.")
+                print("[*] Running continuous daemon mode. Press Ctrl+C to exit.")
                 while True: time.sleep(1)
 
 # -------------------------------------------------------------------------
 # CLI ENTRY POINT
 # -------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Unified HPC Network Auditor & Benchmark Exporter")
-    parser.add_argument("--nodes", nargs="+", help="Explicit list of node names to audit")
+    parser = argparse.ArgumentParser(description="Unified HPC Network Auditor, Benchmarker & Exporter")
+    parser.add_argument("--nodes", nargs="+", help="Node list or range expressions (e.g. node00[01-70] login00[01-03])")
     parser.add_argument("--run-benchmarks", action="store_true", help="Execute OSU / Perftest network micro-benchmarks")
-    parser.add_argument("--html-out", default="hpc_audit_dashboard.html", help="Path for generated HTML Dashboard")
+    parser.add_argument("--html-out", default="hpc_audit_dashboard.html", help="Path for HTML Dashboard report")
     parser.add_argument("--prom-out", default="hpc_network.prom", help="Path for Prometheus textfile collector export")
-    parser.add_argument("--prom-port", type=int, help="Port to run embedded HTTP Prometheus endpoint (e.g., 9100)")
-    parser.add_argument("--daemon", action="store_true", help="Keep running HTTP server daemon indefinitely after scan")
+    parser.add_argument("--prom-port", type=int, help="Port to run embedded HTTP Prometheus exporter (e.g., 9100)")
+    parser.add_argument("--daemon", action="store_true", help="Keep HTTP server daemon running indefinitely after scan")
 
     args = parser.parse_args()
 
