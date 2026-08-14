@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Slurm Daily Efficiency Reporter
-Runs daily as root to parse yesterday's completed jobs per user,
-generates a custom efficiency breakdown, and writes to ~/.share/seff/
+Queries completed Slurm jobs per user, calculates efficiency metrics via seff,
+and writes per-user reports to ~/.local/seff/yesterday_report.txt.
 """
 
 import sys
@@ -10,45 +10,75 @@ import os
 import pwd
 import re
 import shutil
+import argparse
 import subprocess
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-# Minimum UID to consider (prevents generating reports for system daemons)
+# Minimum UID to consider (prevents generating reports for system accounts)
 MIN_UID = 1000
 
-def get_date_range(target_date=None):
-    """Returns (start_str, end_str, display_str) for the query period."""
-    if target_date is None:
-        target_date = datetime.now() - timedelta(days=1)
-    
+def get_binary_path(name):
+    path = shutil.which(name)
+    if not path:
+        # Check standard Slurm install locations as fallback
+        for candidate in [f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/opt/slurm/bin/{name}"]:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return path
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate daily Slurm job efficiency reports per user.")
+    parser.add_argument("--date", help="Target date in YYYY-MM-DD format (default: yesterday)")
+    parser.add_argument("--days-ago", type=int, default=1, help="Number of days ago to report on (default: 1)")
+    parser.add_argument("--user", help="Run only for a specific username (for testing)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose diagnostic output")
+    return parser.parse_args()
+
+def get_date_range(args):
+    """Calculates start and end timestamps for the query window."""
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d")
+    else:
+        target_date = datetime.now() - timedelta(days=args.days_ago)
+
     start_str = target_date.strftime("%Y-%m-%d") + "T00:00:00"
     end_str = target_date.strftime("%Y-%m-%d") + "T23:59:59"
     display_str = target_date.strftime("%Y-%m-%d")
     return start_str, end_str, display_str
 
-def get_yesterday_jobs(start_str, end_str):
-    """Queries sacct for completed/failed/cancelled jobs in the window."""
+def get_jobs(sacct_bin, start_str, end_str, target_user=None, verbose=False):
+    """Queries sacct for jobs within the target time window."""
     cmd = [
-        "sacct", "-a", "-X", "--parsable2", "--noheader",
+        sacct_bin, "-a", "-X", "--parsable2", "--noheader",
         f"--starttime={start_str}",
         f"--endtime={end_str}",
         "--format=JobID,User,JobName,State"
     ]
+    if target_user:
+        cmd.extend(["-u", target_user])
+
+    if verbose:
+        print(f"[DEBUG] Executing: {' '.join(cmd)}")
+
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
     except subprocess.CalledProcessError as e:
-        sys.stderr.write(f"Error querying sacct: {e.stderr}\n")
+        sys.stderr.write(f"[ERROR] sacct query failed: {e.stderr}\n")
         return {}
 
     user_jobs = defaultdict(list)
-    for line in res.stdout.strip().splitlines():
+    raw_lines = res.stdout.strip().splitlines()
+    if verbose:
+        print(f"[DEBUG] sacct returned {len(raw_lines)} job records.")
+
+    for line in raw_lines:
         parts = line.split("|")
         if len(parts) >= 4:
             job_id, user, job_name, state = parts[0], parts[1], parts[2], parts[3]
             if not user or user == "root":
                 continue
-            # Filter out job array sub-steps or interactive steps if -X missed any
+            # Skip job array sub-steps if any slip through
             if "." not in job_id:
                 user_jobs[user].append({
                     "job_id": job_id,
@@ -57,11 +87,13 @@ def get_yesterday_jobs(start_str, end_str):
                 })
     return user_jobs
 
-def parse_seff_output(job_id):
-    """Runs seff <job_id> and extracts CPU and Memory metrics."""
-    cmd = ["seff", str(job_id)]
+def parse_seff_output(seff_bin, job_id, verbose=False):
+    """Runs seff on a job ID and extracts CPU and memory utilization metrics."""
+    cmd = [seff_bin, str(job_id)]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
+        if verbose:
+            print(f"[DEBUG] seff failed for JobID {job_id}: {res.stderr.strip()}")
         return None
 
     output = res.stdout
@@ -73,7 +105,6 @@ def parse_seff_output(job_id):
         "mem_eff": None
     }
 
-    # Regex extractors
     cores_m = re.search(r"Cores:\s+(\d+)", output)
     if cores_m:
         metrics["cores"] = cores_m.group(1)
@@ -97,7 +128,6 @@ def parse_seff_output(job_id):
     return metrics
 
 def calculate_rating(avg_cpu, avg_mem):
-    """Computes overall efficiency and categorizes it."""
     overall_score = (avg_cpu + avg_mem) / 2.0
     if overall_score >= 80.0:
         return overall_score, "EXCELLENT"
@@ -107,9 +137,7 @@ def calculate_rating(avg_cpu, avg_mem):
         return overall_score, "BAD (Needs Improvement)"
 
 def generate_recommendations(avg_cpu, avg_mem, rating):
-    """Produces targeted advice based on where the resource bottlenecks are."""
     tips = []
-    
     if rating == "EXCELLENT":
         tips.append("• Your jobs are utilizing assigned resources exceptionally well! Keep it up.")
         return tips
@@ -123,9 +151,9 @@ def generate_recommendations(avg_cpu, avg_mem, rating):
     if avg_cpu < 50.0:
         tips.append("• CPU / Core Underutilization Detected:")
         tips.append("  - Multiple cores were requested, but were mostly idle during execution.")
-        tips.append("  - Action: If running single-threaded software (e.g., standard Python/R scripts), use '--cpus-per-task=1'.")
-        tips.append("  - Action: If using multithreading, verify OMP_NUM_THREADS matches your requested '--cpus-per-task'.")
-        tips.append("  - Benefit: Frees cluster slots and allows higher throughput for your job arrays.")
+        tips.append("  - Action: If running single-threaded code (e.g. basic Python/R), use '--cpus-per-task=1'.")
+        tips.append("  - Action: If multithreading, verify OMP_NUM_THREADS matches your requested '--cpus-per-task'.")
+        tips.append("  - Benefit: Frees cluster slots and improves throughput for subsequent array jobs.")
 
     if avg_cpu >= 50.0 and avg_mem >= 50.0:
         tips.append("• Moderate efficiency across your workload.")
@@ -134,14 +162,12 @@ def generate_recommendations(avg_cpu, avg_mem, rating):
     return tips
 
 def build_report_text(username, date_str, job_data_list, avg_cpu, avg_mem, overall_score, rating):
-    """Formats the ASCII report table and advisory text."""
     lines = []
     lines.append("=" * 80)
     lines.append(f" SLURM DAILY JOB EFFICIENCY REPORT | User: {username} | Date: {date_str}")
     lines.append("=" * 80)
     lines.append("")
     
-    # Table Header
     header = f"{'JobID':<12} {'State':<12} {'Cores':<6} {'CPU Eff%':<10} {'Req Mem':<12} {'Used Mem':<12} {'Mem Eff%':<10}"
     lines.append(header)
     lines.append("-" * len(header))
@@ -177,52 +203,94 @@ def build_report_text(username, date_str, job_data_list, avg_cpu, avg_mem, overa
     lines.append("=" * 80)
     return "\n".join(lines) + "\n"
 
-def deliver_report(username, report_content):
-    """Writes report to user's ~/.share/seff/ directory with safe permissions."""
+def deliver_report(username, report_content, verbose=False):
+    """Creates ~/.local/seff/ if missing, writes yesterday_report.txt, and sets user ownership."""
     try:
         user_info = pwd.getpwnam(username)
     except KeyError:
-        return
+        if verbose:
+            print(f"[WARN] User '{username}' not found in system passwd/NSS database.")
+        return False
 
-    # Skip system users
     if user_info.pw_uid < MIN_UID:
-        return
+        if verbose:
+            print(f"[INFO] Skipping system user '{username}' (UID: {user_info.pw_uid} < {MIN_UID}).")
+        return False
 
     home_dir = user_info.pw_dir
     if not os.path.exists(home_dir):
-        return
+        if verbose:
+            print(f"[WARN] Home directory '{home_dir}' does not exist for user '{username}'.")
+        return False
 
-    seff_dir = os.path.join(home_dir, ".share", "seff")
+    local_dir = os.path.join(home_dir, ".local")
+    seff_dir = os.path.join(local_dir, "seff")
     report_file = os.path.join(seff_dir, "yesterday_report.txt")
 
     try:
-        # Create directory with 0700 permissions
-        os.makedirs(seff_dir, mode=0o700, exist_ok=True)
-        os.chown(seff_dir, user_info.pw_uid, user_info.pw_gid)
+        # Ensure ~/.local exists
+        if not os.path.exists(local_dir):
+            os.makedirs(local_dir, mode=0o755, exist_ok=True)
+            os.chown(local_dir, user_info.pw_uid, user_info.pw_gid)
 
-        # Write report file with 0600 permissions
+        # Ensure ~/.local/seff exists (0700 permissions)
+        if not os.path.exists(seff_dir):
+            os.makedirs(seff_dir, mode=0o700, exist_ok=True)
+            os.chown(seff_dir, user_info.pw_uid, user_info.pw_gid)
+
+        # Write report file (0600 permissions)
         with open(report_file, "w") as f:
             f.write(report_content)
 
         os.chmod(report_file, 0o600)
         os.chown(report_file, user_info.pw_uid, user_info.pw_gid)
+        
+        if verbose or sys.stdout.isatty():
+            print(f"[SUCCESS] Report written to: {report_file}")
+        return True
+
     except OSError as e:
-        sys.stderr.write(f"Failed writing report for {username}: {e}\n")
+        sys.stderr.write(f"[ERROR] Failed writing report for '{username}': {e}\n")
+        return False
 
 def main():
-    start_str, end_str, display_str = get_date_range()
-    user_jobs = get_yesterday_jobs(start_str, end_str)
+    args = parse_args()
+    is_interactive = sys.stdout.isatty()
+    verbose = args.verbose or is_interactive
+
+    sacct_bin = get_binary_path("sacct")
+    seff_bin = get_binary_path("seff")
+
+    if not sacct_bin or not seff_bin:
+        sys.stderr.write("[ERROR] Could not locate 'sacct' or 'seff' binaries. Check PATH/Slurm installation.\n")
+        sys.exit(1)
+
+    start_str, end_str, display_str = get_date_range(args)
+
+    if verbose:
+        print(f"--- Slurm Daily Efficiency Generator ---")
+        print(f"Target Date: {display_str} ({start_str} to {end_str})")
+        if args.user:
+            print(f"Target User: {args.user}")
+
+    user_jobs = get_jobs(sacct_bin, start_str, end_str, target_user=args.user, verbose=args.verbose)
 
     if not user_jobs:
+        if verbose:
+            print(f"[INFO] No Slurm jobs found for the specified period ({display_str}). Nothing to generate.")
         return
 
+    generated_count = 0
     for username, jobs in user_jobs.items():
+        if verbose:
+            print(f"\nProcessing user '{username}' ({len(jobs)} jobs)...")
+
         processed_jobs = []
         cpu_scores = []
         mem_scores = []
 
         for j in jobs:
-            metrics = parse_seff_output(j["job_id"])
+            metrics = parse_seff_output(seff_bin, j["job_id"], verbose=args.verbose)
             if metrics is None:
                 continue
 
@@ -243,6 +311,8 @@ def main():
                 mem_scores.append(metrics["mem_eff"])
 
         if not processed_jobs:
+            if verbose:
+                print(f"[INFO] No parsable efficiency data from seff for '{username}'.")
             continue
 
         avg_cpu = sum(cpu_scores) / len(cpu_scores) if cpu_scores else 0.0
@@ -259,7 +329,11 @@ def main():
             rating=rating
         )
 
-        deliver_report(username, report_text)
+        if deliver_report(username, report_text, verbose=args.verbose):
+            generated_count += 1
+
+    if verbose:
+        print(f"\n[DONE] Generated reports for {generated_count} user(s).")
 
 if __name__ == "__main__":
     main()
