@@ -1,0 +1,2 @@
+# /etc/cron.d/slurm_daily_efficiency
+5 0 * * * root /usr/bin/python3 /usr/local/sbin/slurm_daily_efficiency_report.py > /dev/null 2>&1
