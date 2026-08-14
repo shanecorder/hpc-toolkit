@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Slurm Daily Efficiency Reporter
+Slurm Daily Efficiency Reporter (Python 3.6+ Compatible)
 Queries completed Slurm jobs per user, calculates efficiency metrics via seff,
 and writes per-user reports to ~/.local/seff/yesterday_report.txt.
 """
@@ -21,8 +21,13 @@ MIN_UID = 1000
 def get_binary_path(name):
     path = shutil.which(name)
     if not path:
-        # Check standard Slurm install locations as fallback
-        for candidate in [f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/opt/slurm/bin/{name}"]:
+        # Check standard Bright / Slurm installation paths
+        for candidate in [
+            f"/cm/shared/apps/slurm/current/bin/{name}",
+            f"/usr/bin/{name}",
+            f"/usr/local/bin/{name}",
+            f"/opt/slurm/bin/{name}"
+        ]:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 return candidate
     return path
@@ -31,7 +36,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generate daily Slurm job efficiency reports per user.")
     parser.add_argument("--date", help="Target date in YYYY-MM-DD format (default: yesterday)")
     parser.add_argument("--days-ago", type=int, default=1, help="Number of days ago to report on (default: 1)")
-    parser.add_argument("--user", help="Run only for a specific username (for testing)")
+    parser.add_argument("--user", help="Run only for a specific username or UID (for testing)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose diagnostic output")
     return parser.parse_args()
 
@@ -56,13 +61,19 @@ def get_jobs(sacct_bin, start_str, end_str, target_user=None, verbose=False):
         "--format=JobID,User,JobName,State"
     ]
     if target_user:
-        cmd.extend(["-u", target_user])
+        cmd.extend(["-u", str(target_user)])
 
     if verbose:
         print(f"[DEBUG] Executing: {' '.join(cmd)}")
 
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=True
+        )
     except subprocess.CalledProcessError as e:
         sys.stderr.write(f"[ERROR] sacct query failed: {e.stderr}\n")
         return {}
@@ -90,7 +101,12 @@ def get_jobs(sacct_bin, start_str, end_str, target_user=None, verbose=False):
 def parse_seff_output(seff_bin, job_id, verbose=False):
     """Runs seff on a job ID and extracts CPU and memory utilization metrics."""
     cmd = [seff_bin, str(job_id)]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    res = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
     if res.returncode != 0:
         if verbose:
             print(f"[DEBUG] seff failed for JobID {job_id}: {res.stderr.strip()}")
@@ -203,11 +219,22 @@ def build_report_text(username, date_str, job_data_list, avg_cpu, avg_mem, overa
     lines.append("=" * 80)
     return "\n".join(lines) + "\n"
 
+def resolve_user_info(username):
+    """Resolves passwd entry by username or by UID."""
+    try:
+        return pwd.getpwnam(str(username))
+    except KeyError:
+        if str(username).isdigit():
+            try:
+                return pwd.getpwuid(int(username))
+            except KeyError:
+                return None
+    return None
+
 def deliver_report(username, report_content, verbose=False):
     """Creates ~/.local/seff/ if missing, writes yesterday_report.txt, and sets user ownership."""
-    try:
-        user_info = pwd.getpwnam(username)
-    except KeyError:
+    user_info = resolve_user_info(username)
+    if not user_info:
         if verbose:
             print(f"[WARN] User '{username}' not found in system passwd/NSS database.")
         return False
@@ -262,7 +289,7 @@ def main():
     seff_bin = get_binary_path("seff")
 
     if not sacct_bin or not seff_bin:
-        sys.stderr.write("[ERROR] Could not locate 'sacct' or 'seff' binaries. Check PATH/Slurm installation.\n")
+        sys.stderr.write(f"[ERROR] Could not locate 'sacct' ({sacct_bin}) or 'seff' ({seff_bin}). Check PATH.\n")
         sys.exit(1)
 
     start_str, end_str, display_str = get_date_range(args)
